@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Read Aloud</string>
+    <string name="open_file">Open file</string>
+    <string name="voice_data">Voice data</string>
+    <string name="no_file">No file opened</string>
+    <string name="hint_text">Open a PDF, DOCX or TXT file — or paste text here</string>
+    <string name="lang_auto">Auto</string>
+    <string name="lang_hi">हिंदी</string>
+    <string name="lang_en">English</string>
+    <string name="voice_hi">Hindi voice</string>
+    <string name="voice_en">English voice</string>
+    <string name="speed">Speed</string>
+    <string name="play">Play</string>
+    <string name="pause">Pause</string>
+    <string name="stop">Stop</string>
+</resources>
