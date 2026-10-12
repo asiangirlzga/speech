@@ -19,8 +19,12 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest already ships the Android SDK (ANDROID_HOME), so the
+      # android-actions/setup-android step is not needed (it fails on the
+      # runner's newer cmdline-tools). Just accept licenses so Gradle can
+      # auto-download platform 34 / build-tools if they are missing.
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       # The project has no gradle-wrapper.jar, so install Gradle directly.
       - name: Set up Gradle
