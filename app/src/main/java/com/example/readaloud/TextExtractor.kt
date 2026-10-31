@@ -1,58 +1,32 @@
 package com.example.readaloud
 
-import android.content.Context
-import android.net.Uri
 import android.util.Xml
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.text.PDFTextStripper
 import org.xmlpull.v1.XmlPullParser
+import java.io.File
+import java.io.InputStream
 import java.util.zip.ZipInputStream
 
-/** Pulls plain text out of PDF, DOCX and TXT files. Runs on a background thread. */
+/** Reads the full text of DOCX and TXT files (PDFs and images are handled page by page in Book.kt). */
 object TextExtractor {
 
-    private var pdfInitDone = false
-
-    fun extract(ctx: Context, uri: Uri, name: String, mime: String?): String {
-        val n = name.lowercase()
-        return when {
-            n.endsWith(".pdf") || mime == "application/pdf" -> pdf(ctx, uri)
-            n.endsWith(".docx") || mime?.contains("wordprocessingml") == true -> docx(ctx, uri)
-            n.endsWith(".txt") || mime?.startsWith("text/") == true -> txt(ctx, uri)
-            else -> throw IllegalArgumentException("Unsupported file type. Use PDF, DOCX or TXT.")
-        }
+    fun read(file: File, type: String): String = when (type) {
+        "txt" -> file.readBytes().toString(Charsets.UTF_8)
+        "docx" -> docx(file)
+        else -> throw IllegalArgumentException("Unsupported file type.")
     }
 
-    private fun txt(ctx: Context, uri: Uri): String =
-        ctx.contentResolver.openInputStream(uri)!!.use { it.readBytes().toString(Charsets.UTF_8) }
-
-    private fun pdf(ctx: Context, uri: Uri): String {
-        if (!pdfInitDone) {
-            PDFBoxResourceLoader.init(ctx.applicationContext)
-            pdfInitDone = true
-        }
-        ctx.contentResolver.openInputStream(uri)!!.use { input ->
-            PDDocument.load(input).use { doc ->
-                return PDFTextStripper().getText(doc).trim()
-            }
-        }
-    }
-
-    private fun docx(ctx: Context, uri: Uri): String {
-        ctx.contentResolver.openInputStream(uri)!!.use { raw ->
-            ZipInputStream(raw).use { zip ->
-                var entry = zip.nextEntry
-                while (entry != null) {
-                    if (entry.name == "word/document.xml") return parseDocxXml(zip)
-                    entry = zip.nextEntry
-                }
+    private fun docx(file: File): String {
+        ZipInputStream(file.inputStream().buffered()).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                if (entry.name == "word/document.xml") return parseDocxXml(zip)
+                entry = zip.nextEntry
             }
         }
         throw IllegalArgumentException("Not a valid .docx file (old .doc is not supported).")
     }
 
-    private fun parseDocxXml(stream: java.io.InputStream): String {
+    private fun parseDocxXml(stream: InputStream): String {
         val parser = Xml.newPullParser()
         parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true)
         parser.setInput(stream, "UTF-8")

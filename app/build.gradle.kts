@@ -36,6 +36,10 @@ android {
 }
 
 dependencies {
-    // Only dependency: PDF text extraction. No AndroidX, no Compose -> small APK.
+    // PDF text-layer extraction. No AndroidX, no Compose -> small APK.
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+    // On-device OCR for scanned PDFs and images (bundled model, works offline).
+    // Devanagari model reads Hindi and Latin (English) text.
+    implementation("com.google.mlkit:text-recognition-devanagari:16.0.1")
+    implementation("com.google.android.gms:play-services-tasks:18.2.0")
 }

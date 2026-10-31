@@ -1,169 +1,146 @@
 package com.example.readaloud
 
+import android.Manifest
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Intent
+import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.provider.OpenableColumns
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
-import android.text.Editable
-import android.text.TextWatcher
-import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.RadioGroup
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.util.Locale
-import java.util.concurrent.Executors
 
-class MainActivity : Activity(), TextToSpeech.OnInitListener {
-
-    private enum class State { IDLE, PLAYING, PAUSED }
+class MainActivity : Activity(), ReaderService.Listener {
 
     private lateinit var tvName: TextView
+    private lateinit var tvPage: TextView
+    private lateinit var tvBody: TextView
+    private lateinit var scroll: ScrollView
     private lateinit var tvStatus: TextView
     private lateinit var tvSpeed: TextView
-    private lateinit var etText: EditText
+    private lateinit var etGo: EditText
     private lateinit var rgLang: RadioGroup
     private lateinit var spHi: Spinner
     private lateinit var spEn: Spinner
     private lateinit var sbSpeed: SeekBar
+    private lateinit var cbOcr: CheckBox
+    private lateinit var btnPlay: Button
+    private lateinit var btnPause: Button
 
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
-    private val io = Executors.newSingleThreadExecutor()
-
+    private var service: ReaderService? = null
+    private var pendingUri: Uri? = null
     private var hiVoices: List<Voice> = emptyList()
     private var enVoices: List<Voice> = emptyList()
-
-    private var state = State.IDLE
-    private var chunks: List<String> = emptyList()
-    private var current = 0
+    private val prefs by lazy { getSharedPreferences("ui", MODE_PRIVATE) }
 
     private val REQ_OPEN = 1001
-    private val MAX_CHUNK = 800
+
+    private val conn = object : ServiceConnection {
+        override fun onServiceConnected(n: ComponentName?, b: IBinder?) {
+            val s = (b as ReaderService.LocalBinder).getService()
+            service = s
+            s.attach(this@MainActivity)
+            pushSettings()
+            val u = pendingUri
+            if (u != null) {
+                pendingUri = null
+                openUri(u)
+            } else {
+                s.restoreLast(cbOcr.isChecked)
+            }
+        }
+
+        override fun onServiceDisconnected(n: ComponentName?) { service = null }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         tvName = findViewById(R.id.tvName)
+        tvPage = findViewById(R.id.tvPage)
+        tvBody = findViewById(R.id.tvBody)
+        scroll = findViewById(R.id.scroll)
         tvStatus = findViewById(R.id.tvStatus)
         tvSpeed = findViewById(R.id.tvSpeed)
-        etText = findViewById(R.id.etText)
+        etGo = findViewById(R.id.etGo)
         rgLang = findViewById(R.id.rgLang)
         spHi = findViewById(R.id.spHi)
         spEn = findViewById(R.id.spEn)
         sbSpeed = findViewById(R.id.sbSpeed)
+        cbOcr = findViewById(R.id.cbOcr)
+        btnPlay = findViewById(R.id.btnPlay)
+        btnPause = findViewById(R.id.btnPause)
+
+        // restore saved UI settings
+        sbSpeed.progress = prefs.getInt("speed", 33)
+        tvSpeed.text = String.format(Locale.US, "%.1fx", rate())
+        rgLang.check(
+            when (prefs.getInt("lang", 0)) { 1 -> R.id.rbHi; 2 -> R.id.rbEn; else -> R.id.rbAuto }
+        )
+        cbOcr.isChecked = prefs.getBoolean("ocr", false)
 
         findViewById<Button>(R.id.btnOpen).setOnClickListener { pickFile() }
         findViewById<Button>(R.id.btnVoiceData).setOnClickListener { openVoiceSettings() }
         findViewById<Button>(R.id.btnPlay).setOnClickListener { play() }
-        findViewById<Button>(R.id.btnPause).setOnClickListener { pause() }
-        findViewById<Button>(R.id.btnStop).setOnClickListener { stop() }
+        btnPause.setOnClickListener { service?.pause() }
+        findViewById<Button>(R.id.btnStop).setOnClickListener { service?.stopReading() }
+        findViewById<Button>(R.id.btnPrev).setOnClickListener { service?.let { it.goToPage(it.currentPage() - 1) } }
+        findViewById<Button>(R.id.btnNext).setOnClickListener { service?.let { it.goToPage(it.currentPage() + 1) } }
+        findViewById<Button>(R.id.btnGo).setOnClickListener { goToTypedPage() }
 
         sbSpeed.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
                 tvSpeed.text = String.format(Locale.US, "%.1fx", rate())
+                if (fromUser) pushSettings()
             }
             override fun onStartTrackingTouch(s: SeekBar?) {}
             override fun onStopTrackingTouch(s: SeekBar?) {}
         })
+        rgLang.setOnCheckedChangeListener { _, _ -> pushSettings() }
+        cbOcr.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean("ocr", checked).apply()
+            service?.reopen(checked)
+        }
 
-        // Any edit to the text invalidates a paused position.
-        etText.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun afterTextChanged(s: Editable?) {
-                if (state == State.PAUSED) state = State.IDLE
-            }
-        })
-
-        tts = TextToSpeech(this, this)
-        handleViewIntent(intent)
+        if (intent?.action == Intent.ACTION_VIEW) pendingUri = intent.data
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleViewIntent(intent)
+        if (intent.action == Intent.ACTION_VIEW) intent.data?.let { openUri(it) }
     }
 
-    private fun handleViewIntent(i: Intent?) {
-        if (i?.action == Intent.ACTION_VIEW) i.data?.let { loadFile(it) }
+    override fun onStart() {
+        super.onStart()
+        bindService(Intent(this, ReaderService::class.java), conn, BIND_AUTO_CREATE)
     }
 
-    // ---------- TTS setup ----------
-
-    override fun onInit(status: Int) {
-        val engine = tts ?: return
-        if (status != TextToSpeech.SUCCESS) {
-            tvStatus.text = "Text-to-speech engine not available on this device."
-            return
-        }
-        ttsReady = true
-        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(id: String?) {}
-            override fun onDone(id: String?) {
-                val idx = id?.removePrefix("c")?.toIntOrNull() ?: return
-                runOnUiThread {
-                    if (state == State.PLAYING && idx == current) {
-                        current++
-                        speakCurrent()
-                    }
-                }
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onError(id: String?) {
-                runOnUiThread { fail("Speech error. Check voice data (button above).") }
-            }
-        })
-        loadVoices()
+    override fun onStop() {
+        service?.detach()
+        service = null
+        try { unbindService(conn) } catch (_: Exception) {}
+        super.onStop()
     }
 
-    private fun loadVoices() {
-        val all = try { tts?.voices?.toList() ?: emptyList() } catch (e: Exception) { emptyList() }
-        hiVoices = all.filter { it.locale.language == "hi" && !it.isNetworkConnectionRequired }
-            .sortedBy { it.name }
-        enVoices = all.filter { it.locale.language == "en" && !it.isNetworkConnectionRequired }
-            .sortedBy { it.name }
-        fill(spHi, hiVoices)
-        fill(spEn, enVoices)
-        if (hiVoices.isEmpty()) {
-            tvStatus.text = "No Hindi voice installed. Tap \"Voice data\" to download one."
-        }
-    }
-
-    private fun fill(sp: Spinner, voices: List<Voice>) {
-        val labels = mutableListOf("Default")
-        voices.forEach { labels.add("${it.name}  (${it.locale.displayCountry})") }
-        sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
-    }
-
-    private fun openVoiceSettings() {
-        try {
-            startActivity(Intent("com.android.settings.TTS_SETTINGS"))
-        } catch (e: Exception) {
-            try {
-                startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA))
-            } catch (e2: Exception) {
-                Toast.makeText(this, "Open Settings > Language > Text-to-speech", Toast.LENGTH_LONG).show()
-            }
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        // Refresh voice list after returning from voice settings.
-        if (ttsReady) loadVoices()
-    }
-
-    // ---------- File loading ----------
+    // ---------- file opening ----------
 
     private fun pickFile() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -173,7 +150,8 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
                 Intent.EXTRA_MIME_TYPES, arrayOf(
                     "application/pdf",
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    "text/plain"
+                    "text/plain",
+                    "image/*"
                 )
             )
         }
@@ -185,187 +163,135 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_OPEN && resultCode == RESULT_OK) data?.data?.let { loadFile(it) }
+        if (requestCode == REQ_OPEN && resultCode == RESULT_OK) data?.data?.let { openUri(it) }
     }
 
-    private fun displayName(uri: Uri): String {
+    private fun openUri(uri: Uri) {
+        val s = service
+        if (s == null) { pendingUri = uri; return }
+        var name = uri.lastPathSegment ?: "file"
+        var size = -1L
         contentResolver.query(uri, null, null, null, null)?.use { c ->
-            val col = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (col >= 0 && c.moveToFirst()) return c.getString(col) ?: ""
-        }
-        return uri.lastPathSegment ?: "file"
-    }
-
-    private fun loadFile(uri: Uri) {
-        stop()
-        val name = displayName(uri)
-        val mime = contentResolver.getType(uri)
-        tvName.text = name
-        tvStatus.text = "Reading file…"
-        io.execute {
-            try {
-                val text = TextExtractor.extract(this, uri, name, mime)
-                runOnUiThread {
-                    etText.setText(text)
-                    state = State.IDLE
-                    tvStatus.text = if (text.isBlank())
-                        "No readable text found (scanned PDFs need OCR)."
-                    else "Loaded ${text.length} characters."
-                }
-            } catch (e: Throwable) {
-                runOnUiThread { fail("Could not read file: ${e.message}") }
+            if (c.moveToFirst()) {
+                val n = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val z = c.getColumnIndex(OpenableColumns.SIZE)
+                if (n >= 0) name = c.getString(n) ?: name
+                if (z >= 0 && !c.isNull(z)) size = c.getLong(z)
             }
         }
+        s.importAndOpen(uri, name, size, contentResolver.getType(uri), cbOcr.isChecked)
     }
 
-    // ---------- Playback ----------
+    // ---------- playback controls ----------
+
+    private fun play() {
+        val s = service ?: return
+        if (!s.canPlay()) { toast("Open a file first (and wait for the speech engine)"); return }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
+        pushSettings()
+        val i = Intent(this, ReaderService::class.java)
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+        s.play()
+    }
+
+    private fun goToTypedPage() {
+        val n = etGo.text.toString().trim().toIntOrNull()
+        if (n == null || n < 1) { toast("Enter a page number"); return }
+        service?.goToPage(n - 1)
+        etGo.text.clear()
+        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(etGo.windowToken, 0)
+    }
 
     private fun rate(): Float = 0.5f + sbSpeed.progress / 100f * 1.5f
 
-    private fun play() {
-        if (!ttsReady) { toast("Speech engine still starting…"); return }
-        if (state == State.PAUSED) {
-            state = State.PLAYING
-            keepAwake(true)
-            speakCurrent()
-            return
-        }
-        val text = etText.text.toString()
-        if (text.isBlank()) { toast("Open a file or paste some text first"); return }
-        chunks = splitChunks(text)
-        current = 0
-        state = State.PLAYING
-        keepAwake(true)
-        speakCurrent()
-    }
-
-    private fun pause() {
-        if (state != State.PLAYING) return
-        state = State.PAUSED
-        tts?.stop()
-        keepAwake(false)
-        tvStatus.text = "Paused at part ${current + 1} of ${chunks.size}"
-    }
-
-    private fun stop() {
-        state = State.IDLE
-        tts?.stop()
-        current = 0
-        keepAwake(false)
-        if (ttsReady) tvStatus.text = ""
-    }
-
-    private fun speakCurrent() {
-        val engine = tts ?: return
-        if (state != State.PLAYING) return
-        if (current >= chunks.size) {
-            state = State.IDLE
-            current = 0
-            keepAwake(false)
-            tvStatus.text = "Finished."
-            return
-        }
-        val chunk = chunks[current]
-        val lang = when (rgLang.checkedRadioButtonId) {
-            R.id.rbHi -> "hi"
-            R.id.rbEn -> "en"
-            else -> detectLang(chunk)
-        }
-        if (!applyLanguage(engine, lang)) {
-            fail(
-                if (lang == "hi") "Hindi voice data missing. Tap \"Voice data\" to install it."
-                else "English voice data missing. Tap \"Voice data\" to install it."
-            )
-            return
-        }
-        engine.setSpeechRate(rate())
-        tvStatus.text = "Reading part ${current + 1} of ${chunks.size} (${if (lang == "hi") "हिंदी" else "English"})"
-        engine.speak(chunk, TextToSpeech.QUEUE_FLUSH, null, "c$current")
-    }
-
-    /** Sets locale, then the user's chosen voice for that language if any. */
-    private fun applyLanguage(engine: TextToSpeech, lang: String): Boolean {
-        val candidates = if (lang == "hi") listOf(Locale("hi", "IN"))
-        else listOf(Locale("en", "IN"), Locale.US)
-        var ok = false
-        for (loc in candidates) {
-            val r = engine.setLanguage(loc)
-            if (r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED) {
-                ok = true
-                break
-            }
-        }
-        if (!ok) return false
-        val sp = if (lang == "hi") spHi else spEn
-        val list = if (lang == "hi") hiVoices else enVoices
+    private fun voiceName(sp: Spinner, list: List<Voice>): String? {
         val pos = sp.selectedItemPosition
-        if (pos > 0 && pos - 1 < list.size) {
-            try { engine.voice = list[pos - 1] } catch (_: Exception) {}
-        }
-        return true
+        return if (pos > 0 && pos - 1 < list.size) list[pos - 1].name else null
     }
 
-    // ---------- Text helpers ----------
+    private fun pushSettings() {
+        val mode = when (rgLang.checkedRadioButtonId) { R.id.rbHi -> 1; R.id.rbEn -> 2; else -> 0 }
+        val hi = voiceName(spHi, hiVoices)
+        val en = voiceName(spEn, enVoices)
+        service?.setSettings(mode, hi, en, rate())
+        if (hiVoices.isNotEmpty() || enVoices.isNotEmpty()) {
+            prefs.edit().putInt("speed", sbSpeed.progress).putInt("lang", mode)
+                .putString("hi", hi).putString("en", en).apply()
+        } else {
+            prefs.edit().putInt("speed", sbSpeed.progress).putInt("lang", mode).apply()
+        }
+    }
 
-    private fun detectLang(s: String): String {
-        var dev = 0
-        var lat = 0
-        for (ch in s) {
-            when {
-                ch in 'ऀ'..'ॿ' -> dev++
-                ch in 'A'..'Z' || ch in 'a'..'z' -> lat++
+    private fun openVoiceSettings() {
+        try {
+            startActivity(Intent("com.android.settings.TTS_SETTINGS"))
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA))
+            } catch (e2: Exception) {
+                toast("Open Settings > Language > Text-to-speech")
             }
         }
-        return if (dev > lat) "hi" else "en"
     }
 
-    /** Splits on sentence ends (. ! ? । and newlines) into pieces of <= MAX_CHUNK chars. */
-    private fun splitChunks(text: String): List<String> {
-        val clean = text.replace("\r", "").replace(Regex("[ \\t]+"), " ")
-        val sentences = clean.split(Regex("(?<=[.!?।\\n])\\s+"))
-        val out = ArrayList<String>()
-        val sb = StringBuilder()
-        fun flush() {
-            val t = sb.toString().trim()
-            if (t.isNotEmpty()) out.add(t)
-            sb.setLength(0)
-        }
-        for (s in sentences) {
-            var piece = s
-            while (piece.length > MAX_CHUNK) {
-                flush()
-                var cut = piece.lastIndexOf(' ', MAX_CHUNK)
-                if (cut <= 0) cut = MAX_CHUNK
-                out.add(piece.substring(0, cut).trim())
-                piece = piece.substring(cut)
-            }
-            if (sb.length + piece.length + 1 > MAX_CHUNK) flush()
-            sb.append(piece).append(' ')
-        }
-        flush()
-        return out.filter { it.any { c -> c.isLetterOrDigit() } }
+    override fun onResume() {
+        super.onResume()
+        // refresh the voice list after returning from voice settings
+        service?.let { if (it.canPlay()) fillVoices(it) }
     }
 
-    // ---------- Misc ----------
+    // ---------- ReaderService.Listener ----------
 
-    private fun fail(msg: String) {
-        state = State.IDLE
-        tts?.stop()
-        keepAwake(false)
+    override fun onTtsReady() {
+        service?.let { fillVoices(it) }
+    }
+
+    private fun fillVoices(s: ReaderService) {
+        hiVoices = s.voices("hi")
+        enVoices = s.voices("en")
+        fill(spHi, hiVoices, prefs.getString("hi", null))
+        fill(spEn, enVoices, prefs.getString("en", null))
+        if (hiVoices.isEmpty()) tvStatus.text = "No Hindi voice installed. Tap \"Voice data\" to download one."
+        val l = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: android.view.View?, pos: Int, id: Long) = pushSettings()
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
+        spHi.onItemSelectedListener = l
+        spEn.onItemSelectedListener = l
+        pushSettings()
+    }
+
+    private fun fill(sp: Spinner, voices: List<Voice>, saved: String?) {
+        val labels = mutableListOf("Default")
+        voices.forEach { labels.add("${it.name}  (${it.locale.displayCountry})") }
+        sp.onItemSelectedListener = null
+        sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
+        val idx = voices.indexOfFirst { it.name == saved }
+        if (idx >= 0) sp.setSelection(idx + 1)
+    }
+
+    override fun onBookLoaded(name: String, pages: Int) {
+        tvName.text = name
+    }
+
+    override fun onPage(page: Int, total: Int, text: String) {
+        tvPage.text = "Page ${page + 1} / $total"
+        tvBody.text = text
+        scroll.scrollTo(0, 0)
+    }
+
+    override fun onState(state: ReaderService.State) {
+        btnPlay.isEnabled = state != ReaderService.State.PLAYING
+        btnPause.isEnabled = state == ReaderService.State.PLAYING
+    }
+
+    override fun onStatus(msg: String) {
         tvStatus.text = msg
     }
 
-    private fun keepAwake(on: Boolean) {
-        if (on) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-    }
-
     private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
-
-    override fun onDestroy() {
-        tts?.stop()
-        tts?.shutdown()
-        io.shutdown()
-        super.onDestroy()
-    }
 }
